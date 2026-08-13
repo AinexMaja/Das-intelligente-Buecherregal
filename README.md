@@ -1,5 +1,92 @@
 # Intelligent Bookshelf - ESP32-S2 rewrite plan
 
+## Quick start
+
+This project is currently in the ESP32-S2 rewrite phase. The working setup is:
+
+- the board runs MicroPython
+- the board owns motors, LEDs, and board-side command handling
+- the laptop runs a mock socket server for contract validation
+- the board can either send commands to the server or receive commands from it
+
+### Typical setup flow
+
+1. Connect the board over USB.
+2. Open the REPL:
+
+```bash
+python -m serial.tools.miniterm /dev/ttyACM0 115200
+```
+
+3. Configure the Wi‑Fi connection:
+
+```python
+from board.wifi_manager import WifiManager
+wifi = WifiManager("wifi_credentials.json")
+wifi.add_network("MyWiFiSSID", "MyWiFiPassword")
+print(wifi.connect_saved(timeout=30))
+```
+
+4. Upload the board files:
+
+```bash
+ampy --port /dev/ttyACM0 put boot.py boot.py
+ampy --port /dev/ttyACM0 put board /board
+```
+
+5. Start the mock server on the laptop:
+
+```bash
+python3 test_loopback_server.py
+```
+
+6. Run the board-side probe:
+
+```python
+import board.tests.socket_api_probe as probe
+probe.main()
+```
+
+### Supported commands
+
+The board/server contract currently supports these commands:
+
+- `move_to`
+- `move_steps`
+- `set_led`
+- `clear_leds`
+- `home`
+- `status`
+
+Example command payload:
+
+```json
+{
+  "type": "command",
+  "command": "move_steps",
+  "args": {
+    "steps": 50,
+    "direction": "cw"
+  }
+}
+```
+
+Example response:
+
+```json
+{
+  "type": "event",
+  "event": "done",
+  "command": "move_steps",
+  "status": "ok",
+  "payload": {
+    "steps": 50,
+    "direction": "cw",
+    "position_steps": 50
+  }
+}
+```
+
 ## Goal
 
 This project originally ran as a Raspberry Pi + Flask app that directly controlled the motor and LED strip. For the next-generation design, the robot hardware should be separated cleanly from the server application.
@@ -315,6 +402,109 @@ Watch the board serial monitor for output such as:
 - `Motor test ok`
 - `Local hardware test complete`
 
+## Board inventory and runtime usage
+
+The board-side project is structured as a MicroPython runtime, not a desktop Python app.
+The files currently expected on the ESP32-S2 are:
+
+- `boot.py` for startup Wi‑Fi auto-connect
+- `board/wifi_manager.py` for saved Wi‑Fi credentials and connection logic
+- `board/robot_controller.py` for command dispatch
+- `board/drivers/stepper_motor.py` for motor motion logic
+- `board/drivers/led_strip.py` for LED control
+- `board/tests/local_hardware_test.py` for direct device smoke testing
+- `board/tests/socket_api_probe.py` for socket API validation
+
+### Connect to the board
+
+Connect the ESP32-S2 over USB and open the serial console.
+
+Example:
+
+```bash
+python -m serial.tools.miniterm /dev/ttyACM0 115200
+```
+
+Then at the MicroPython REPL you can run commands like:
+
+```python
+import network
+sta = network.WLAN(network.STA_IF)
+sta.active(True)
+print(sta.isconnected())
+print(sta.ifconfig())
+```
+
+### Connect to Wi‑Fi from the board
+
+```python
+from board.wifi_manager import WifiManager
+wifi = WifiManager("wifi_credentials.json")
+wifi.add_network("MyWiFiSSID", "MyWiFiPassword")
+print(wifi.connect_saved(timeout=30))
+```
+
+You can also call:
+
+```python
+wifi.connect_known("MyWiFiSSID", "MyWiFiPassword")
+```
+
+### Upload files to the board
+
+Example using `ampy`:
+
+```bash
+ampy --port /dev/ttyACM0 put boot.py boot.py
+ampy --port /dev/ttyACM0 put board /board
+```
+
+### Run the local hardware smoke test
+
+From the board REPL:
+
+```python
+import board.tests.local_hardware_test as test
+test.main()
+```
+
+### Run the socket API probe
+
+From the board REPL:
+
+```python
+import board.tests.socket_api_probe as probe
+probe.main()
+```
+
+This sends the standard command sequence:
+
+- `move_steps`
+- `set_led`
+- `home`
+
+and prints the JSON responses from the server.
+
+### Use the mock server locally
+
+Start the laptop-side mock server:
+
+```bash
+python3 test_loopback_server.py
+```
+
+This acts as a real API endpoint for the board. It accepts the same JSON command contract and returns JSON event payloads.
+
+### Server-first mode
+
+The mock server also supports the server-driven pattern: the server can send commands to the board over a persistent socket, and the board replies with a JSON event object.
+
+This is validated with:
+
+```bash
+python3 test_loopback_server.py --server-first
+```
+
 ## Important notes
 
 - Do not use desktop Python assumptions on the board.
@@ -322,6 +512,124 @@ Watch the board serial monitor for output such as:
 - Keep all device access inside the driver layer.
 - Treat the motor and LEDs as resources managed by the robot controller.
 - Use the socket API as the only communication boundary between the board and server.
+- The board should respond with JSON event objects and the server should treat commands uniformly regardless of who initiates the socket.
+
+## Troubleshooting
+
+This section captures the main issues that were hit during the ESP32-S2 validation work.
+
+### 1. The board has no IP address
+
+Symptoms:
+
+```python
+sta.isconnected()
+# False
+
+sta.ifconfig()
+# ('0.0.0.0', '0.0.0.0', '0.0.0.0', '0.0.0.0')
+```
+
+What this means:
+
+- the board is not connected to Wi‑Fi yet
+- no usable LAN IP is available
+- the socket API cannot reach the laptop or server
+
+How to fix:
+
+```python
+from board.wifi_manager import WifiManager
+wifi = WifiManager("wifi_credentials.json")
+print(wifi.get_networks())
+print(wifi.scan())
+wifi.add_network("MyWiFiSSID", "MyWiFiPassword")
+print(wifi.connect_saved(timeout=30))
+```
+
+### 2. Socket connection times out
+
+Symptoms:
+
+```python
+OSError: [Errno 116] ETIMEDOUT
+```
+
+Usually this means:
+
+- the board is connected to Wi‑Fi but cannot reach the server
+- the laptop IP changed
+- the server is not listening on the correct address
+- the firewall blocks port 9000
+- the router uses client isolation
+
+Check the laptop IP:
+
+```bash
+hostname -I
+```
+
+Then verify the server is listening on the correct address:
+
+```bash
+sudo ss -tulpn | grep 9000
+```
+
+The server should be bound to the real LAN IP and not `127.0.0.1`.
+
+### 3. Using `127.0.0.1` on the board is wrong
+
+`127.0.0.1` is loopback only. The board cannot use it to reach another device on the Wi‑Fi network.
+
+Correct pattern:
+
+```python
+SERVER_HOST = "192.168.178.69"
+SERVER_PORT = 9000
+```
+
+The server must also bind to the active LAN interface, not a loopback-only address.
+
+### 4. The board is running MicroPython, not desktop Python
+
+This is one of the biggest mistakes to avoid.
+
+Do not use:
+
+- `flask`
+- `sqlite3`
+- `RPi.GPIO`
+- desktop-only assumptions about file layout
+
+Use instead:
+
+- `network`
+- `socket`
+- `machine`
+- `json`
+- MicroPython-compatible driver patterns
+
+### 5. The mock server is not yet the production server
+
+The file `test_loopback_server.py` is a validation server only.
+It proves the protocol and command flow work, but it is not the final production backend.
+
+It is designed to help with:
+
+- JSON socket validation
+- command/response compatibility checks
+- board-to-server contract verification
+
+### 6. Server-first mode is supported by the test harness
+
+The server can also push commands to the board instead of board-initiated requests.
+The mock implementation supports that pattern for local tests.
+
+Example:
+
+```bash
+python3 test_loopback_server.py --server-first
+```
 
 ## Recommended next steps
 
@@ -330,5 +638,6 @@ Watch the board serial monitor for output such as:
 3. implement the server-side skeleton with the same JSON command schema
 4. connect the board to the real limit switches and LEDs
 5. validate the test script on the physical device
+6. move from the mock server to the real backend service once the protocol is stable
 
 This gives a clean, testable path from the current Raspberry Pi prototype to an ESP32-S2 based robot controller.
